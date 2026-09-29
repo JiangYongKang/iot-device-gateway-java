@@ -9,6 +9,10 @@ public class GatewayProperties {
     private int maxTelemetryPerDevice = 1000;
     private int ruleQueueCapacity = 200;
     private int maxEventsPerDevice = 500;
+    private int maxRuleVersionsPerRule = 50;
+    private int maxRuleAuditEntries = 1000;
+    private int maxTrialEvents = 5000;
+    private int maxConcurrentTrials = 2;
     private long commandTtlSeconds = 300;
     private int maxDevices = 1000;
 
@@ -20,6 +24,14 @@ public class GatewayProperties {
     public void setRuleQueueCapacity(int v) { this.ruleQueueCapacity = v; }
     public int getMaxEventsPerDevice() { return maxEventsPerDevice; }
     public void setMaxEventsPerDevice(int v) { this.maxEventsPerDevice = v; }
+    public int getMaxRuleVersionsPerRule() { return maxRuleVersionsPerRule; }
+    public void setMaxRuleVersionsPerRule(int v) { this.maxRuleVersionsPerRule = v; }
+    public int getMaxRuleAuditEntries() { return maxRuleAuditEntries; }
+    public void setMaxRuleAuditEntries(int v) { this.maxRuleAuditEntries = v; }
+    public int getMaxTrialEvents() { return maxTrialEvents; }
+    public void setMaxTrialEvents(int v) { this.maxTrialEvents = v; }
+    public int getMaxConcurrentTrials() { return maxConcurrentTrials; }
+    public void setMaxConcurrentTrials(int v) { this.maxConcurrentTrials = v; }
     public long getCommandTtlSeconds() { return commandTtlSeconds; }
     public void setCommandTtlSeconds(long v) { this.commandTtlSeconds = v; }
     public int getMaxDevices() { return maxDevices; }
