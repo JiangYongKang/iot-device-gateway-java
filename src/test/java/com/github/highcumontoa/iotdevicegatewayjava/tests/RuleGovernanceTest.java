@@ -22,11 +22,13 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -142,82 +144,351 @@ class RuleGovernanceTest {
                 true, Instant.now()));
         RuleDefinition v2 = rules.prepareCandidate(new RuleDefinition(ruleId, 0, field,
                 40.0, "alarm", true, Instant.now()), "候选阈值40");
-        // 再准备 v3：阈值降到 20，保证与 v1/v2 都可区分（值 25：v1不命中 v3命中）
+        // 再准备 v3：阈值降到 20，保证与 v1/v2 都可区分（值 25：v1/v2不命中 v3命中）
         RuleDefinition v3 = rules.prepareCandidate(new RuleDefinition(ruleId, 0, field,
                 20.0, "alarm", true, Instant.now()), "候选阈值20");
 
+        // 确定性前置：切换开始前同步落定一批 v1 事件，v1 必有归属，不依赖并发时序
+        List<String> submittedIds = new java.util.concurrent.CopyOnWriteArrayList<>();
+        for (int i = 0; i < 3; i++) {
+            String eid = "gov-sw-pre-" + i;
+            RuleVerdict v = rules.submit(event(eid, field, 25.0));
+            assertEquals(1, v.ruleVersion());
+            submittedIds.add(eid);
+        }
+
         int threads = 12;
-        int perThread = 40;
-        ExecutorService pool = Executors.newFixedThreadPool(threads + 1);
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
         CountDownLatch start = new CountDownLatch(1);
-        CountDownLatch switchedToV2 = new CountDownLatch(1);
-        CountDownLatch switchedToV3 = new CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicBoolean stop =
+                new java.util.concurrent.atomic.AtomicBoolean();
         AtomicReference<Throwable> workerError = new AtomicReference<>();
         List<Future<?>> futures = new ArrayList<>();
 
-        // 事件提交线程：在两个切换屏障之间持续提交“值25”事件
+        // 事件提交线程：持续提交“值25”事件直到主线程完成两次切换；
+        // 每条事件 id 先登记再提交，对账集合与并发时序无关
         for (int t = 0; t < threads; t++) {
             final int idx = t;
             futures.add(pool.submit(() -> {
                 try {
                     start.await();
-                    for (int i = 0; i < perThread; i++) {
-                        String eid = "gov-sw-e-" + idx + "-" + i;
+                    int n = 0;
+                    while (!stop.get() && n < 2000) {
+                        String eid = "gov-sw-e-" + idx + "-" + n++;
+                        submittedIds.add(eid);
                         rules.submit(event(eid, field, 25.0));
-                        if (i == perThread / 2) {
-                            switchedToV2.countDown();
-                        }
                     }
-                    switchedToV3.countDown();
                 } catch (Throwable e) {
                     workerError.compareAndSet(null, e);
                 }
             }));
         }
         start.countDown();
-        // 等事件提交进行到中段时切到 v2，再等收尾时切到 v3，切换与实时判定强制并发。
+        // 等事件流真正跑起来（实时判定与后续切换必然并发交织），再发起两次切换。
         // 高压下切换可能被明确拒绝（RULE_SWITCH_CONFLICT），按语义重试，最终必须成功且无半状态。
-        assertTrue(switchedToV2.await(10, TimeUnit.SECONDS));
+        long processedBefore = rules.stats().processed();
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (rules.stats().processed() < processedBefore + threads
+                && System.nanoTime() < deadline) {
+            Thread.sleep(1);
+        }
+        assertTrue(rules.stats().processed() >= processedBefore + threads,
+                "事件流未在预期时间内跑起来");
         RuleDefinition afterV2 = activateWithRetry(ruleId, v2.version(), "并发切换至v2");
         assertEquals(v2.version(), afterV2.version());
-        assertTrue(switchedToV3.await(10, TimeUnit.SECONDS));
         RuleDefinition afterV3 = activateWithRetry(ruleId, v3.version(), "并发切换至v3");
         assertEquals(v3.version(), afterV3.version());
+        stop.set(true);
         for (Future<?> f : futures) {
             f.get(10, TimeUnit.SECONDS);
         }
         pool.shutdown();
         assertNull(workerError.get(), "并发提交/切换期间不应有异常");
 
+        // 确定性后置：最终切换完成后补一条哨兵事件，必归属最终生效版本 v3
+        RuleVerdict sentinel = rules.submit(event("gov-sw-sentinel", field, 25.0));
+        assertEquals(v3.version(), sentinel.ruleVersion());
+        assertTrue(sentinel.fired());
+        submittedIds.add("gov-sw-sentinel");
+        assertEquals(v3.version(), rules.getRule(ruleId).version(), "最终生效版本必须是 v3");
+
         // 对账：每条事件恰好一条结论；按归属版本分组，值25下 v1/v2 不命中、v3 命中，
         // 版本归属与 fired 必须自洽，且不存在“半版本”结论。
         Map<Integer, Integer> countByVersion = new HashMap<>();
         int total = 0;
-        for (int t = 0; t < threads; t++) {
-            for (int i = 0; i < perThread; i++) {
-                String eid = "gov-sw-e-" + t + "-" + i;
-                List<RuleVerdict> verdicts = rules.verdicts(eid);
-                assertEquals(1, verdicts.size(), "事件 " + eid + " 必须恰好判定一次");
-                RuleVerdict v = verdicts.get(0);
-                countByVersion.merge(v.ruleVersion(), 1, Integer::sum);
-                boolean expectFired = v.ruleVersion() == v3.version();
-                assertEquals(expectFired, v.fired(),
-                        "事件 " + eid + " 归属 v" + v.ruleVersion() + "，结论必须与该版本一致");
-                total++;
-            }
+        for (String eid : submittedIds) {
+            List<RuleVerdict> verdicts = rules.verdicts(eid);
+            assertEquals(1, verdicts.size(), "事件 " + eid + " 必须恰好判定一次");
+            RuleVerdict v = verdicts.get(0);
+            countByVersion.merge(v.ruleVersion(), 1, Integer::sum);
+            boolean expectFired = v.ruleVersion() == v3.version();
+            assertEquals(expectFired, v.fired(),
+                    "事件 " + eid + " 归属 v" + v.ruleVersion() + "，结论必须与该版本一致");
+            total++;
         }
         log.info("[版本选择] 并发切换对账 总数={} 按版本分布={}（v1/v2阈值>=25不命中，v3阈值20命中）",
                 total, countByVersion);
-        assertEquals(threads * perThread, total, "不漏判任何一条事件");
-        // 切换边界清晰：v2 切换发生在提交中段，v1 与 v3 至少都有事件归属；
-        // 任何归属 v2 的事件结论必须是 v2 的结论（不命中），上面已逐条断言。
+        assertEquals(submittedIds.size(), total, "不漏判任何一条事件");
+        // 切换边界清晰且不依赖时序：前置事件保证 v1 有归属，哨兵事件保证 v3 有归属；
+        // v2 是否有归属取决于切换与事件流的相对速度，两种结果都合法，不断言。
         assertTrue(countByVersion.getOrDefault(1, 0) > 0, "切换前事件归属 v1");
         assertTrue(countByVersion.getOrDefault(v3.version(), 0) > 0, "切换后事件归属 v3");
 
-        List<RuleAuditEntry> switches = rules.auditTrail(ruleId).stream()
+        // 留痕对账：成功与被拒绝的切换尝试分开统计。
+        // 成功序列必须恰好是 1->v2、v2->v3 两笔且顺序不变；
+        // 被拒绝的尝试（遇忙拒绝后已按语义重试）次数随并发时序变化，属合法留痕，
+        // 只校验其内容可解释，不计入“整体失败”。
+        List<RuleAuditEntry> activates = rules.auditTrail(ruleId).stream()
                 .filter(a -> "ACTIVATE".equals(a.action())).toList();
-        assertEquals(2, switches.size());
-        assertTrue(switches.stream().allMatch(a -> "SUCCESS".equals(a.outcome())));
+        List<RuleAuditEntry> succeeded = activates.stream()
+                .filter(a -> "SUCCESS".equals(a.outcome())).toList();
+        List<RuleAuditEntry> rejected = activates.stream()
+                .filter(a -> "REJECTED".equals(a.outcome())).toList();
+        assertEquals(activates.size(), succeeded.size() + rejected.size(),
+                "切换留痕只有 SUCCESS/REJECTED 两种结局，不允许出现第三种状态");
+        assertEquals(2, succeeded.size(), "成功切换必须恰好两笔（被拒绝的尝试不算失败也不算成功）");
+        assertEquals(1, succeeded.get(0).fromVersion());
+        assertEquals(v2.version(), succeeded.get(0).toVersion());
+        assertEquals(v2.version(), succeeded.get(1).fromVersion());
+        assertEquals(v3.version(), succeeded.get(1).toVersion());
+        assertTrue(succeeded.get(0).seq() < succeeded.get(1).seq(), "成功切换顺序必须可核对");
+        for (RuleAuditEntry r : rejected) {
+            assertNotNull(r.reason(), "被拒绝的尝试必须留痕原因");
+            assertNotNull(r.detail());
+            assertTrue(r.toVersion() == v2.version() || r.toVersion() == v3.version(),
+                    "被拒绝的尝试必须指向本次切换目标之一: " + r);
+            assertTrue(r.fromVersion() != null && r.fromVersion() != r.toVersion(),
+                    "遇忙拒绝时旧版本继续服务，留痕源版本不得等于目标版本: " + r);
+        }
+        log.info("[判定依据] 切换留痕 成功={} 被拒绝={}（拒绝已重试，不影响最终归属）",
+                succeeded.size(), rejected.size());
+    }
+
+    /**
+     * 交织场景确定性验收：实时处理与切换并发 -> 切换被明确拒绝 -> 按约定重试 -> 最终切换成功。
+     * 同一场景连跑三轮（每轮独立规则），每轮的最终生效版本、逐事件归属、
+     * 成功/拒绝留痕序列必须逐轮字面一致，证明结果不随并发时序漂移。
+     */
+    @Test
+    void rejectedSwitchRetriedToSuccessInterleavedWithLiveTrafficReconcilesDeterministically()
+            throws Exception {
+        List<List<String>> roundAudits = new ArrayList<>();
+        for (int round = 1; round <= 3; round++) {
+            roundAudits.add(interleavedSwitchRound(round));
+        }
+        log.info("[判定依据] 三轮留痕序列：{}", roundAudits);
+        assertEquals(roundAudits.get(0), roundAudits.get(1),
+                "同一组切换与重试重复跑，留痕序列必须一致");
+        assertEquals(roundAudits.get(1), roundAudits.get(2),
+                "同一组切换与重试重复跑，留痕序列必须一致");
+    }
+
+    /** 单轮交织场景，返回该轮治理留痕的紧凑序列（action:outcome:from->to）。 */
+    private List<String> interleavedSwitchRound(int round) throws Exception {
+        String field = "gov-interleave-temp-r" + round;
+        String ruleId = "gov-hot-interleave-r" + round;
+        String idPrefix = "gov-il-r" + round + "-";
+        // v1 阈值30 / v2 阈值40 / v3 阈值20：值25 仅在 v3 下命中
+        rules.putRule(new RuleDefinition(ruleId, 0, field, 30.0, "alarm",
+                true, Instant.now()));
+        RuleDefinition v2 = rules.prepareCandidate(new RuleDefinition(ruleId, 0, field,
+                40.0, "alarm", true, Instant.now()), idPrefix + "候选v2");
+        RuleDefinition v3 = rules.prepareCandidate(new RuleDefinition(ruleId, 0, field,
+                20.0, "alarm", true, Instant.now()), idPrefix + "候选v3");
+
+        List<String> submittedIds = new CopyOnWriteArrayList<>();
+        long submittedBefore = rules.stats().submitted();
+        long processedBefore = rules.stats().processed();
+
+        // 实时流量线程：持续提交值25事件；pauseRequested/parked 构成确定性“停靠”握手，
+        // 主线程只在确认流量线程不持有任何锁之后才发起必须一次成功的切换。
+        AtomicBoolean stop = new AtomicBoolean();
+        AtomicBoolean pauseRequested = new AtomicBoolean();
+        AtomicBoolean parked = new AtomicBoolean();
+        AtomicReference<Throwable> trafficError = new AtomicReference<>();
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        Future<?> traffic = pool.submit(() -> {
+            int n = 0;
+            try {
+                while (!stop.get() && n < 5000) {
+                    if (pauseRequested.get()) {
+                        parked.set(true);
+                        while (pauseRequested.get() && !stop.get()) {
+                            Thread.sleep(1);
+                        }
+                        parked.set(false);
+                        continue;
+                    }
+                    String eid = idPrefix + "live-" + n++;
+                    submittedIds.add(eid);
+                    rules.submit(event(eid, field, 25.0));
+                }
+            } catch (Throwable t) {
+                trafficError.compareAndSet(null, t);
+            }
+        });
+
+        try {
+            // —— 阶段1：实时判定占住切换锁，activate v2 被明确拒绝；释放后停靠流量，重试成功 ——
+            CountDownLatch insideEvaluate = new CountDownLatch(1);
+            CountDownLatch releaseEvaluate = new CountDownLatch(1);
+            AtomicBoolean evaluateBlockOnce = new AtomicBoolean(true);
+            rules.setBeforeEvaluateHook(() -> {
+                if (evaluateBlockOnce.compareAndSet(true, false)) {
+                    insideEvaluate.countDown();
+                    try {
+                        releaseEvaluate.await(5, TimeUnit.SECONDS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            });
+            try {
+                assertTrue(insideEvaluate.await(10, TimeUnit.SECONDS),
+                        "实时流量应有事件进入判定临界区");
+                GatewayException busy = assertThrows(GatewayException.class,
+                        () -> rules.activate(ruleId, v2.version(),
+                                idPrefix + "首次切换v2-应被拒"));
+                log.info("[判定依据] 第{}轮 判定占用切换锁时 activate code={}",
+                        round, busy.code());
+                assertEquals(ErrorCode.RULE_SWITCH_CONFLICT, busy.code());
+                assertEquals(1, rules.getRule(ruleId).version(),
+                        "合法拒绝不是失败：旧版本 v1 继续稳定服务");
+                releaseEvaluate.countDown();
+            } finally {
+                rules.setBeforeEvaluateHook(null);
+            }
+            // 停靠握手：parked=true 意味着流量线程不持有任何锁，此后的切换必一次成功
+            pauseRequested.set(true);
+            awaitTrue(parked::get, "第" + round + "轮 实时流量停靠");
+            RuleDefinition afterV2 = rules.activate(ruleId, v2.version(),
+                    idPrefix + "重试切换v2");
+            assertEquals(v2.version(), afterV2.version(), "被拒绝后按约定重试必须能成功");
+            // 主线程标记事件：确定性归属当前生效版本 v2
+            submittedIds.add(idPrefix + "mark-v2");
+            RuleVerdict markV2 = rules.submit(event(idPrefix + "mark-v2", field, 25.0));
+            assertEquals(v2.version(), markV2.ruleVersion());
+            assertFalse(markV2.fired());
+            // 恢复实时流量：v2 生效期间持续有事件流入
+            pauseRequested.set(false);
+
+            // —— 阶段2：后台切换 v3 占住切换锁，前台回退 v1 被拒；后台成功后前台重试回退成功 ——
+            // 先停靠流量再发起后台切换：后台切换必能进入临界区（否则 tryLock 拒绝的是它自己）
+            pauseRequested.set(true);
+            awaitTrue(parked::get, "第" + round + "轮 实时流量二次停靠");
+            CountDownLatch insideSwitch = new CountDownLatch(1);
+            CountDownLatch releaseSwitch = new CountDownLatch(1);
+            AtomicBoolean switchBlockOnce = new AtomicBoolean(true);
+            rules.setBeforeSwitchHook(() -> {
+                if (switchBlockOnce.compareAndSet(true, false)) {
+                    insideSwitch.countDown();
+                    try {
+                        releaseSwitch.await(5, TimeUnit.SECONDS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            });
+            Future<RuleDefinition> toV3;
+            try {
+                toV3 = pool.submit(() -> rules.activate(ruleId, v3.version(),
+                        idPrefix + "切换v3"));
+                assertTrue(insideSwitch.await(10, TimeUnit.SECONDS),
+                        "后台切换应进入切换临界区");
+                GatewayException busyRollback = assertThrows(GatewayException.class,
+                        () -> rules.rollback(ruleId, 1, idPrefix + "并发回退v1-应被拒"));
+                assertEquals(ErrorCode.RULE_SWITCH_CONFLICT, busyRollback.code());
+                assertEquals(v2.version(), rules.getRule(ruleId).version(),
+                        "回退被拒后仍稳定生效 v2，不受并发切换半成品影响");
+                releaseSwitch.countDown();
+            } finally {
+                rules.setBeforeSwitchHook(null);
+            }
+            assertEquals(v3.version(), toV3.get(5, TimeUnit.SECONDS).version());
+            // 主线程标记事件：确定性归属 v3（值25 在 v3 阈值20 下命中）
+            submittedIds.add(idPrefix + "mark-v3");
+            RuleVerdict markV3 = rules.submit(event(idPrefix + "mark-v3", field, 25.0));
+            assertEquals(v3.version(), markV3.ruleVersion());
+            assertTrue(markV3.fired());
+            RuleDefinition back = rules.rollback(ruleId, 1, idPrefix + "重试回退v1");
+            assertEquals(1, back.version(), "并发切换完成后，被拒绝的回退重试必须成功");
+
+            // —— 收尾：恢复流量证明 v1 下持续服务，随后停止；哨兵事件归属最终版本 v1 ——
+            pauseRequested.set(false);
+            int liveMark = submittedIds.size();
+            awaitTrue(() -> submittedIds.size() > liveMark,
+                    "第" + round + "轮 回退后实时流量应继续按 v1 服务");
+            stop.set(true);
+            traffic.get(10, TimeUnit.SECONDS);
+            assertNull(trafficError.get(), "实时流量线程不应有异常");
+            RuleVerdict sentinel = rules.submit(event(idPrefix + "sentinel", field, 25.0));
+            assertEquals(1, sentinel.ruleVersion(), "最终生效版本为回退后的 v1");
+            assertFalse(sentinel.fired());
+            submittedIds.add(idPrefix + "sentinel");
+            assertEquals(1, rules.getRule(ruleId).version());
+
+            // —— 对账：每条事件恰好一条结论，fired 与归属版本自洽（值25 仅 v3 命中） ——
+            Map<Integer, Integer> countByVersion = new HashMap<>();
+            for (String eid : submittedIds) {
+                List<RuleVerdict> verdicts = rules.verdicts(eid);
+                assertEquals(1, verdicts.size(), "事件 " + eid + " 必须恰好判定一次");
+                RuleVerdict v = verdicts.get(0);
+                assertEquals(v.ruleVersion() == v3.version(), v.fired(),
+                        "事件 " + eid + " 归属 v" + v.ruleVersion() + "，结论必须与该版本一致");
+                countByVersion.merge(v.ruleVersion(), 1, Integer::sum);
+            }
+            // 统计守恒：本轮提交数与处理数增量一致，不漏判、不重复判定
+            assertEquals(submittedIds.size(), rules.stats().submitted() - submittedBefore,
+                    "本轮提交计数必须守恒");
+            assertEquals(submittedIds.size(), rules.stats().processed() - processedBefore,
+                    "本轮处理计数必须守恒");
+            log.info("[版本选择] 第{}轮交织对账 总数={} 按版本分布={}",
+                    round, submittedIds.size(), countByVersion);
+
+            // —— 留痕对账：成功与拒绝分开统计，序列固定可核对 ——
+            List<RuleAuditEntry> trail = rules.auditTrail(ruleId);
+            List<RuleAuditEntry> succeeded = trail.stream()
+                    .filter(a -> "SUCCESS".equals(a.outcome())).toList();
+            List<RuleAuditEntry> rejected = trail.stream()
+                    .filter(a -> "REJECTED".equals(a.outcome())).toList();
+            assertEquals(trail.size(), succeeded.size() + rejected.size(),
+                    "留痕只有 SUCCESS/REJECTED 两种结局");
+            assertEquals(3, succeeded.size(), "成功切换恰好三笔：启用v2、启用v3、回退v1");
+            assertEquals(2, rejected.size(), "被拒绝的尝试恰好两笔：两次遇忙拒绝");
+            assertEquals("ACTIVATE", rejected.get(0).action());
+            assertEquals("ROLLBACK", rejected.get(1).action());
+            List<String> summary = new ArrayList<>();
+            for (RuleAuditEntry a : trail) {
+                summary.add(a.action() + ":" + a.outcome() + ":"
+                        + a.fromVersion() + "->" + a.toVersion());
+            }
+            List<String> expected = List.of(
+                    "ACTIVATE:REJECTED:1->" + v2.version(),
+                    "ACTIVATE:SUCCESS:1->" + v2.version(),
+                    "ROLLBACK:REJECTED:" + v2.version() + "->1",
+                    "ACTIVATE:SUCCESS:" + v2.version() + "->" + v3.version(),
+                    "ROLLBACK:SUCCESS:" + v3.version() + "->1");
+            assertEquals(expected, summary,
+                    "第" + round + "轮留痕序列必须可核对：拒绝与成功分开追溯、顺序固定");
+            return summary;
+        } finally {
+            stop.set(true);
+            pauseRequested.set(false);
+            pool.shutdownNow();
+            rules.setBeforeEvaluateHook(null);
+            rules.setBeforeSwitchHook(null);
+        }
+    }
+
+    private static void awaitTrue(java.util.function.BooleanSupplier cond, String what)
+            throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (!cond.getAsBoolean()) {
+            if (System.nanoTime() > deadline) {
+                org.junit.jupiter.api.Assertions.fail("等待超时: " + what);
+            }
+            Thread.sleep(1);
+        }
     }
 
     @Test

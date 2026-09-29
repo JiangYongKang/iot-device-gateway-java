@@ -637,28 +637,48 @@ public class RuleEngineService {
                     "规则 " + ruleId + " 当前已生效 v" + version + "，无需切换");
         }
         if (!switchLock.tryLock()) {
-            audit(action, ruleId, current.version(), version, reason, "REJECTED",
+            // 拒绝瞬间重读一次生效版本，让留痕/提示尽量贴近真实（仍为观察值，非临界区快照）
+            RuleDefinition now = rules.get(ruleId);
+            int observed = now == null ? current.version() : now.version();
+            audit(action, ruleId, observed, version, reason, "REJECTED",
                     "切换与实时判定/另一切换并发，明确拒绝，旧版本继续服务");
             throw new GatewayException(ErrorCode.RULE_SWITCH_CONFLICT,
                     "规则切换繁忙（与实时判定并发），已拒绝本次切换，"
-                            + "当前仍稳定生效 v" + current.version() + "，请稍后重试");
+                            + "当前仍稳定生效 v" + observed + "，请稍后重试");
         }
+        int fromVersion;
         try {
             Runnable switchHook = beforeSwitchHook;
             if (switchHook != null) {
                 switchHook.run();
             }
+            // 临界区内以权威当前版本复核：等待锁期间另一次并发切换可能已改变生效版本，
+            // from-version 必须取临界区内的真实值，拒绝/成功留痕才经得起对账。
+            RuleDefinition authoritative = rules.get(ruleId);
+            if (authoritative == null) {
+                throw new GatewayException(ErrorCode.RULE_NOT_FOUND,
+                        "规则 " + ruleId + " 不存在，无法" + action);
+            }
+            if (authoritative.version() == version) {
+                // 目标版本已被并发切换生效：本次按无操作明确拒绝并留痕，绝不重复记 SUCCESS。
+                // audit 只取 queueLock，锁序与 processOne 一致（switchLock -> queueLock），无环。
+                audit(action, ruleId, authoritative.version(), version, reason,
+                        "REJECTED", "目标版本已被并发切换生效，本次为无操作拒绝");
+                throw new GatewayException(ErrorCode.RULE_SWITCH_CONFLICT,
+                        "规则 " + ruleId + " 当前已生效 v" + version + "，无需切换");
+            }
+            fromVersion = authoritative.version();
             // 临界区内不允许有实时判定穿插：rules 引用整体替换，事件要么全按旧、要么全按新。
             rules.put(ruleId, target);
             candidates.remove(ruleId);
         } finally {
             switchLock.unlock();
         }
-        audit(action, ruleId, current.version(), target.version(), reason, "SUCCESS",
+        audit(action, ruleId, fromVersion, target.version(), reason, "SUCCESS",
                 "切换后实时事件按 v" + target.version() + " 判定");
         log.info("规则{}完成 ruleId={} v{} -> v{}",
                 "ROLLBACK".equals(action) ? "回退" : "启用",
-                ruleId, current.version(), target.version());
+                ruleId, fromVersion, target.version());
         return target;
     }
 
