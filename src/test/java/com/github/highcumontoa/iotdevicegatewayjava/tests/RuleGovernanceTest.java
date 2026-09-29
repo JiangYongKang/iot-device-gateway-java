@@ -10,6 +10,7 @@ import com.github.highcumontoa.iotdevicegatewayjava.model.rulegov.RuleAuditEntry
 import com.github.highcumontoa.iotdevicegatewayjava.model.rulegov.RuleReviewResult;
 import com.github.highcumontoa.iotdevicegatewayjava.model.rulegov.TrialReport;
 import com.github.highcumontoa.iotdevicegatewayjava.model.rulegov.VerdictComparison;
+import com.github.highcumontoa.iotdevicegatewayjava.rule.RuleBackpressureStats;
 import com.github.highcumontoa.iotdevicegatewayjava.rule.RuleEngineService;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
@@ -148,46 +149,79 @@ class RuleGovernanceTest {
 
         int threads = 12;
         int perThread = 40;
-        ExecutorService pool = Executors.newFixedThreadPool(threads + 1);
+        RuleBackpressureStats statsBefore = rules.stats();
+        // 每个工作线程分三阶段提交：v1 阶段 / v2 阶段 / v3 阶段；
+        // 阶段推进由主线程在“切换成功后”显式开闸，保证每个生效版本下都确定有事件进入判定，
+        // 不再依赖“某线程恰好跑到一半”这种随机器负载变化的偶然时序。
+        int phase1 = perThread / 3;
+        int phase2 = perThread / 3;
+        int phase3 = perThread - phase1 - phase2;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
         CountDownLatch start = new CountDownLatch(1);
-        CountDownLatch switchedToV2 = new CountDownLatch(1);
-        CountDownLatch switchedToV3 = new CountDownLatch(1);
+        CountDownLatch gateV2 = new CountDownLatch(1);
+        CountDownLatch gateV3 = new CountDownLatch(1);
+        // 判定点（切换锁临界区内）计数：确认已有足够事件真正在对应版本的临界区内开始判定，
+        // 主线程此刻发起切换必然与在途实时判定真实并发（可能 BUSY 被拒，按约定重试）。
+        java.util.concurrent.atomic.AtomicInteger evalSeenV1 =
+                new java.util.concurrent.atomic.AtomicInteger();
+        java.util.concurrent.atomic.AtomicInteger evalSeenV2 =
+                new java.util.concurrent.atomic.AtomicInteger();
+        CountDownLatch v1EvaluationsInFlight = new CountDownLatch(threads);
+        CountDownLatch v2EvaluationsInFlight = new CountDownLatch(threads);
         AtomicReference<Throwable> workerError = new AtomicReference<>();
         List<Future<?>> futures = new ArrayList<>();
+        rules.setBeforeEvaluateHook(() -> {
+            int liveVersion = rules.getRule(ruleId).version();
+            if (liveVersion == 1 && evalSeenV1.getAndIncrement() < threads) {
+                v1EvaluationsInFlight.countDown();
+            } else if (liveVersion == v2.version() && evalSeenV2.getAndIncrement() < threads) {
+                v2EvaluationsInFlight.countDown();
+            }
+        });
 
-        // 事件提交线程：在两个切换屏障之间持续提交“值25”事件
+        // 事件提交线程：三段“值25”事件，段间在闸门前等待，提交本身始终与切换并发。
         for (int t = 0; t < threads; t++) {
             final int idx = t;
             futures.add(pool.submit(() -> {
                 try {
                     start.await();
-                    for (int i = 0; i < perThread; i++) {
-                        String eid = "gov-sw-e-" + idx + "-" + i;
-                        rules.submit(event(eid, field, 25.0));
-                        if (i == perThread / 2) {
-                            switchedToV2.countDown();
-                        }
+                    for (int i = 0; i < phase1; i++) {
+                        rules.submit(event("gov-sw-e-" + idx + "-" + i, field, 25.0));
                     }
-                    switchedToV3.countDown();
+                    gateV2.await();
+                    for (int i = phase1; i < phase1 + phase2; i++) {
+                        rules.submit(event("gov-sw-e-" + idx + "-" + i, field, 25.0));
+                    }
+                    gateV3.await();
+                    for (int i = phase1 + phase2; i < perThread; i++) {
+                        rules.submit(event("gov-sw-e-" + idx + "-" + i, field, 25.0));
+                    }
                 } catch (Throwable e) {
                     workerError.compareAndSet(null, e);
                 }
             }));
         }
-        start.countDown();
-        // 等事件提交进行到中段时切到 v2，再等收尾时切到 v3，切换与实时判定强制并发。
-        // 高压下切换可能被明确拒绝（RULE_SWITCH_CONFLICT），按语义重试，最终必须成功且无半状态。
-        assertTrue(switchedToV2.await(10, TimeUnit.SECONDS));
-        RuleDefinition afterV2 = activateWithRetry(ruleId, v2.version(), "并发切换至v2");
-        assertEquals(v2.version(), afterV2.version());
-        assertTrue(switchedToV3.await(10, TimeUnit.SECONDS));
-        RuleDefinition afterV3 = activateWithRetry(ruleId, v3.version(), "并发切换至v3");
-        assertEquals(v3.version(), afterV3.version());
-        for (Future<?> f : futures) {
-            f.get(10, TimeUnit.SECONDS);
+        try {
+            start.countDown();
+            // 等够 threads 条事件已经在 v1 判定临界区内开始判定，再切 v2：切换与判定强制并发；
+            // 若被 BUSY 明确拒绝，旧版本继续服务，按语义重试直到成功，无半生效状态。
+            assertTrue(v1EvaluationsInFlight.await(10, TimeUnit.SECONDS));
+            RuleDefinition afterV2 = activateWithRetry(ruleId, v2.version(), "并发切换至v2");
+            assertEquals(v2.version(), afterV2.version());
+            gateV2.countDown();
+            // 同样保证 v2 生效期间有事件在 v2 临界区内判定，再切 v3。
+            assertTrue(v2EvaluationsInFlight.await(10, TimeUnit.SECONDS));
+            RuleDefinition afterV3 = activateWithRetry(ruleId, v3.version(), "并发切换至v3");
+            assertEquals(v3.version(), afterV3.version());
+            gateV3.countDown();
+            for (Future<?> f : futures) {
+                f.get(10, TimeUnit.SECONDS);
+            }
+            assertNull(workerError.get(), "并发提交/切换期间不应有异常");
+        } finally {
+            rules.setBeforeEvaluateHook(null);
+            pool.shutdown();
         }
-        pool.shutdown();
-        assertNull(workerError.get(), "并发提交/切换期间不应有异常");
 
         // 对账：每条事件恰好一条结论；按归属版本分组，值25下 v1/v2 不命中、v3 命中，
         // 版本归属与 fired 必须自洽，且不存在“半版本”结论。
@@ -209,15 +243,223 @@ class RuleGovernanceTest {
         log.info("[版本选择] 并发切换对账 总数={} 按版本分布={}（v1/v2阈值>=25不命中，v3阈值20命中）",
                 total, countByVersion);
         assertEquals(threads * perThread, total, "不漏判任何一条事件");
-        // 切换边界清晰：v2 切换发生在提交中段，v1 与 v3 至少都有事件归属；
-        // 任何归属 v2 的事件结论必须是 v2 的结论（不命中），上面已逐条断言。
-        assertTrue(countByVersion.getOrDefault(1, 0) > 0, "切换前事件归属 v1");
-        assertTrue(countByVersion.getOrDefault(v3.version(), 0) > 0, "切换后事件归属 v3");
+        // 切换边界清晰且覆盖稳定（下界与线程调度无关）：
+        // v1/v2 都至少有 threads 条事件在各自判定临界区内被计数；
+        // v3 阶段整段在 v3 成功开闸之后，phase3 事件必然全部归属 v3。
+        assertTrue(countByVersion.getOrDefault(1, 0) >= threads, "切换前确有事件归属 v1");
+        assertTrue(countByVersion.getOrDefault(v2.version(), 0) >= threads,
+                "v2 生效期间确有事件归属 v2");
+        assertTrue(countByVersion.getOrDefault(v3.version(), 0) >= threads * phase3,
+                "v3 开闸后的事件全部归属 v3");
+        assertEquals(v3.version(), rules.getRule(ruleId).version(), "最终生效版本必须是 v3");
 
-        List<RuleAuditEntry> switches = rules.auditTrail(ruleId).stream()
+        // 留痕对账：成功记录与拒绝记录必须能分开追溯，且不依赖并发时序（拒绝多少次都不影响结论）。
+        List<RuleAuditEntry> activateEntries = rules.auditTrail(ruleId).stream()
                 .filter(a -> "ACTIVATE".equals(a.action())).toList();
-        assertEquals(2, switches.size());
-        assertTrue(switches.stream().allMatch(a -> "SUCCESS".equals(a.outcome())));
+        List<RuleAuditEntry> succeeded = activateEntries.stream()
+                .filter(a -> "SUCCESS".equals(a.outcome())).toList();
+        List<RuleAuditEntry> rejected = activateEntries.stream()
+                .filter(a -> "REJECTED".equals(a.outcome())).toList();
+        // 成功切换恰好两次，迁移路径确定：1->2、2->3，与重试/撞车次数无关。
+        assertEquals(2, succeeded.size(), "成功切换恰好两次（被拒尝试不算成功也不算失败）");
+        assertEquals(1, succeeded.get(0).fromVersion());
+        assertEquals(v2.version(), succeeded.get(0).toVersion());
+        assertEquals(v2.version(), succeeded.get(1).fromVersion());
+        assertEquals(v3.version(), succeeded.get(1).toVersion());
+        assertTrue(succeeded.get(0).seq() < succeeded.get(1).seq());
+        // 所有被拒尝试都必须是“繁忙拒绝”，且记录的 fromVersion 是拒绝时真正生效的版本，
+        // toVersion 是被拒目标；每一条拒绝都在其后续成功之前，绝不允许 REJECT_SAME/版本错乱。
+        for (RuleAuditEntry r : rejected) {
+            assertTrue(r.detail().startsWith("REJECT_BUSY"),
+                    "并发压测中只允许繁忙拒绝，实际 detail=" + r.detail());
+            if (r.toVersion().equals(v2.version())) {
+                assertEquals(1, r.fromVersion(), "拒绝切 v2 时生效版本只能是 v1");
+                assertTrue(r.seq() < succeeded.get(0).seq());
+            } else {
+                assertEquals(v3.version(), r.toVersion());
+                assertEquals(v2.version(), r.fromVersion(), "拒绝切 v3 时生效版本只能是 v2");
+                assertTrue(r.seq() > succeeded.get(0).seq());
+                assertTrue(r.seq() < succeeded.get(1).seq());
+            }
+        }
+        log.info("[判定依据] 切换留痕分开核对：成功={} 条，繁忙拒绝={} 条（随并发时序变化但不影响对账）",
+                succeeded.size(), rejected.size());
+
+        // 最终统计不变量：480 提交 480 处理，无背压丢弃、无毒消息、队列排空，
+        // 一次合法拒绝不进任何失败计数，重试成功不重复计数。
+        // 注意 stats() 为引擎级全局计数器（Spring 上下文跨用例共享），按本用例前后差值核对。
+        RuleBackpressureStats finalStats = rules.stats();
+        assertEquals(threads * perThread,
+                finalStats.submitted() - statsBefore.submitted(), "提交数确定");
+        assertEquals(threads * perThread,
+                finalStats.processed() - statsBefore.processed(), "处理数=提交数，拒绝/重试不影响统计");
+        assertEquals(0L, finalStats.droppedBackpressure() - statsBefore.droppedBackpressure(),
+                "本场景不应触发背压丢弃");
+        assertEquals(0L, finalStats.failedPoison() - statsBefore.failedPoison(),
+                "本场景无毒消息");
+        assertEquals(0, finalStats.queueDepth(), "处理完成后队列必须排空");
+    }
+
+    /**
+     * 确定性交织：实时判定占住切换锁期间，切换被明确拒绝（且按约定重试仍被拒），
+     * 系统持续按旧版本稳定服务；判定结束后重试切换成功，后续事件整体按新版本判定。
+     * 同一段交织重复执行多轮，最终生效版本、逐条事件归属、成功/拒绝分开的留痕必须完全一致，
+     * 不依赖任何线程时序偶然性（不使用 tryLock 撞运气，由屏障精确编排）。
+     */
+    @Test
+    void rejectedSwitchKeepsOldVersionAndRetryAfterBusyPeriodSucceedsDeterministically()
+            throws Exception {
+        String field = "gov-retry-temp";
+        String ruleId = "gov-hot-retry";
+        // 4) 统计不被拒绝污染：3 提交 3 处理，无丢弃无毒消息（全局计数器按差值核对）
+        RuleBackpressureStats stBefore = rules.stats();
+        rules.putRule(new RuleDefinition(ruleId, 0, field, 30.0, "alarm",
+                true, Instant.now()));
+        RuleDefinition v2 = rules.prepareCandidate(new RuleDefinition(ruleId, 0, field,
+                40.0, "alarm", true, Instant.now()), "拒绝重试用候选v2");
+        RuleDefinition v3 = rules.prepareCandidate(new RuleDefinition(ruleId, 0, field,
+                20.0, "alarm", true, Instant.now()), "拒绝重试用候选v3");
+
+        // 编排：实时判定进入切换临界区后先到齐两个切换线程（各自 tryLock 必失败、被明确拒绝），
+        // 再放行判定；判定结束后两个线程按顺序重试，成功顺序确定为 v2 先、v3 后。
+        CountDownLatch insideEvaluate = new CountDownLatch(1);
+        CountDownLatch rejectedProbe = new CountDownLatch(2);
+        CountDownLatch releaseEvaluate = new CountDownLatch(1);
+        rules.setBeforeEvaluateHook(() -> {
+            insideEvaluate.countDown();
+            try {
+                releaseEvaluate.await(5, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        ExecutorService pool = Executors.newFixedThreadPool(3);
+        try {
+            // 事件1：值35，在 v1(阈值30) 命中；其判定全程占住切换锁
+            Future<RuleVerdict> e1 = pool.submit(
+                    () -> rules.submit(event("gov-retry-e1", field, 35.0)));
+            assertTrue(insideEvaluate.await(5, TimeUnit.SECONDS));
+
+            // 两个切换尝试并发撞在判定临界区上：必须都被明确拒绝，且留痕可分开追溯
+            Future<GatewayException> rejectV2 = pool.submit(() -> {
+                try {
+                    rules.activate(ruleId, v2.version(), "繁忙期切换v2");
+                    return null;
+                } catch (GatewayException ex) {
+                    rejectedProbe.countDown();
+                    return ex;
+                }
+            });
+            Future<GatewayException> rejectV3 = pool.submit(() -> {
+                try {
+                    rules.activate(ruleId, v3.version(), "繁忙期切换v3");
+                    return null;
+                } catch (GatewayException ex) {
+                    rejectedProbe.countDown();
+                    return ex;
+                }
+            });
+            assertTrue(rejectedProbe.await(5, TimeUnit.SECONDS), "两个切换尝试都应被拒绝");
+            // 被拒期间旧版本持续稳定服务（此时判定锁仍被 e1 持有，生效引用不可能被动过）
+            assertEquals(1, rules.getRule(ruleId).version(), "合法拒绝后仍按旧版本 v1 服务");
+            GatewayException ex2 = rejectV2.get(5, TimeUnit.SECONDS);
+            GatewayException ex3 = rejectV3.get(5, TimeUnit.SECONDS);
+            assertNotNull(ex2);
+            assertNotNull(ex3);
+            assertEquals(ErrorCode.RULE_SWITCH_CONFLICT, ex2.code());
+            assertEquals(ErrorCode.RULE_SWITCH_CONFLICT, ex3.code());
+            assertEquals(1, rules.getRule(ruleId).version(), "两次拒绝后仍稳定生效 v1");
+
+            // 放行判定：事件1整体按旧版本 v1 判定（v1 阈值30，值35 命中）
+            releaseEvaluate.countDown();
+            RuleVerdict v1Verdict = e1.get(5, TimeUnit.SECONDS);
+            assertEquals(1, v1Verdict.ruleVersion());
+            assertTrue(v1Verdict.fired());
+
+            // 判定结束后重试：v2 先成功、v3 后成功（顺序固定，事件归属不随时序变化）
+            RuleDefinition onV2 = rules.activate(ruleId, v2.version(), "重试启用v2");
+            assertEquals(v2.version(), onV2.version());
+            RuleVerdict e2 = rules.submit(event("gov-retry-e2", field, 25.0));
+            assertEquals(v2.version(), e2.ruleVersion(), "v2 生效后事件归属 v2");
+            assertFalse(e2.fired(), "值25 在 v2(阈值40) 不命中");
+
+            RuleDefinition onV3 = rules.activate(ruleId, v3.version(), "重试启用v3");
+            assertEquals(v3.version(), onV3.version());
+            RuleVerdict e3 = rules.submit(event("gov-retry-e3", field, 25.0));
+            assertEquals(v3.version(), e3.ruleVersion(), "v3 生效后事件归属 v3");
+            assertTrue(e3.fired(), "值25 在 v3(阈值20) 命中");
+
+            // 再试一次已生效的 v3：幂等拒绝，不算成功、不算失败，不影响最终生效版本
+            GatewayException same = assertThrows(GatewayException.class,
+                    () -> rules.activate(ruleId, v3.version(), "重复切换v3"));
+            assertEquals(ErrorCode.RULE_SWITCH_CONFLICT, same.code());
+            assertEquals(v3.version(), rules.getRule(ruleId).version());
+        } finally {
+            rules.setBeforeEvaluateHook(null);
+            pool.shutdown();
+        }
+
+        // ===== 逐轮确定的最终对账（同一段交织重复跑，以下结果必须逐字节一致） =====
+        // 1) 最终生效版本
+        assertEquals(v3.version(), rules.getRule(ruleId).version());
+        // 2) 每条事件恰好一条结论，版本归属与 fired 自洽
+        Map<String, Integer> versionByEvent = new HashMap<>();
+        Map<String, Boolean> firedByEvent = new HashMap<>();
+        for (String eid : List.of("gov-retry-e1", "gov-retry-e2", "gov-retry-e3")) {
+            List<RuleVerdict> vs = rules.verdicts(eid);
+            assertEquals(1, vs.size(), eid + " 必须恰好判定一次，拒绝/重试不造成重复判定");
+            versionByEvent.put(eid, vs.get(0).ruleVersion());
+            firedByEvent.put(eid, vs.get(0).fired());
+        }
+        assertEquals(Map.of(
+                "gov-retry-e1", 1,
+                "gov-retry-e2", v2.version(),
+                "gov-retry-e3", v3.version()), versionByEvent,
+                "事件版本归属必须逐轮一致：e1->v1, e2->v2, e3->v3");
+        assertEquals(Map.of(
+                "gov-retry-e1", true,
+                "gov-retry-e2", false,
+                "gov-retry-e3", true), firedByEvent,
+                "事件结论必须逐轮一致，不允许一部分按旧规则一部分按新规则");
+
+        // 3) 成功记录与拒绝记录分开追溯，条数、版本对、顺序全部确定
+        List<RuleAuditEntry> all = rules.auditTrail(ruleId).stream()
+                .filter(a -> "ACTIVATE".equals(a.action())).toList();
+        List<RuleAuditEntry> ok = all.stream()
+                .filter(a -> "SUCCESS".equals(a.outcome())).toList();
+        List<RuleAuditEntry> busy = all.stream()
+                .filter(a -> "REJECTED".equals(a.outcome())
+                        && a.detail().startsWith("REJECT_BUSY")).toList();
+        List<RuleAuditEntry> sameRejects = all.stream()
+                .filter(a -> "REJECTED".equals(a.outcome())
+                        && a.detail().startsWith("REJECT_SAME")).toList();
+        assertEquals(2, ok.size());
+        assertEquals(List.of(1, v2.version()),
+                List.of(ok.get(0).fromVersion(), ok.get(0).toVersion()));
+        assertEquals(List.of(v2.version(), v3.version()),
+                List.of(ok.get(1).fromVersion(), ok.get(1).toVersion()));
+        assertEquals(2, busy.size(), "繁忙期两次尝试各留一条 REJECT_BUSY，且 fromVersion 均为 v1");
+        for (RuleAuditEntry r : busy) {
+            assertEquals(1, r.fromVersion(), "被拒时生效版本仍是 v1，拒绝不影响版本归属");
+            assertTrue(r.seq() < ok.get(0).seq(), "所有繁忙拒绝都发生在任何成功切换之前");
+        }
+        assertEquals(1, sameRejects.size(), "重复切换当前版本留下一条 REJECT_SAME");
+        assertEquals(v3.version(), sameRejects.get(0).fromVersion());
+        assertTrue(sameRejects.get(0).seq() > ok.get(1).seq());
+        // 繁忙拒绝按目标版本也能分别查清
+        assertEquals(1, busy.stream().filter(r -> r.toVersion().equals(v2.version())).count());
+        assertEquals(1, busy.stream().filter(r -> r.toVersion().equals(v3.version())).count());
+        log.info("[判定依据] 拒绝/重试/成功留痕可分开追溯：SUCCESS {}，REJECT_BUSY {}，REJECT_SAME {}",
+                ok.stream().map(a -> a.fromVersion() + "->" + a.toVersion()).toList(),
+                busy.stream().map(a -> a.fromVersion() + "->" + a.toVersion()).toList(),
+                sameRejects.stream().map(a -> a.fromVersion() + "->" + a.toVersion()).toList());
+
+        // 4) 统计不被拒绝污染：3 提交 3 处理，无丢弃无毒消息（全局计数器按差值核对）
+        RuleBackpressureStats st = rules.stats();
+        assertEquals(3, st.submitted() - stBefore.submitted());
+        assertEquals(3, st.processed() - stBefore.processed());
+        assertEquals(0L, st.droppedBackpressure() - stBefore.droppedBackpressure());
+        assertEquals(0L, st.failedPoison() - stBefore.failedPoison());
     }
 
     @Test

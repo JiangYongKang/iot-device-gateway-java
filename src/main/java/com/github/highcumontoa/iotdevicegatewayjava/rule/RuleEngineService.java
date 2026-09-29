@@ -615,35 +615,62 @@ public class RuleEngineService {
         return switchVersion(ruleId, version, reason, "ROLLBACK");
     }
 
+    /**
+     * 拒绝留痕 detail 的稳定前缀（机读标记，措辞不随线程时序变化，便于按类型分开追溯）。
+     * REJECT_BUSY：并发繁忙拒绝（可重试）；REJECT_SAME：目标即当前版本（无操作）；
+     * REJECT_MISSING：目标版本不存在。
+     */
+    static final String REJECT_BUSY = "REJECT_BUSY";
+    static final String REJECT_SAME = "REJECT_SAME";
+    static final String REJECT_MISSING = "REJECT_MISSING";
+
     private RuleDefinition switchVersion(String ruleId, int version, String reason,
                                          String action) {
-        RuleDefinition current = rules.get(ruleId);
-        if (current == null) {
+        RuleDefinition existing = rules.get(ruleId);
+        if (existing == null) {
             throw new GatewayException(ErrorCode.RULE_NOT_FOUND,
                     "规则 " + ruleId + " 不存在，无法" + action);
         }
         NavigableMap<Integer, RuleDefinition> history = ruleHistory.get(ruleId);
         RuleDefinition target = history == null ? null : history.get(version);
         if (target == null) {
-            audit(action, ruleId, current.version(), version, reason, "REJECTED",
-                    "目标历史版本不存在");
+            audit(action, ruleId, existing.version(), version, reason, "REJECTED",
+                    REJECT_MISSING + "：目标历史版本不存在，当前仍稳定生效 v"
+                            + existing.version());
             throw new GatewayException(ErrorCode.RULE_NOT_FOUND,
                     "规则 " + ruleId + " 不存在历史版本 v" + version);
         }
-        if (current.version() == version) {
-            audit(action, ruleId, current.version(), version, reason, "REJECTED",
-                    "目标版本即当前生效版本，切换被拒绝（无操作）");
-            throw new GatewayException(ErrorCode.RULE_SWITCH_CONFLICT,
-                    "规则 " + ruleId + " 当前已生效 v" + version + "，无需切换");
-        }
+        // tryLock 失败只代表“此刻繁忙”：明确拒绝、不触碰任何版本状态，
+        // 留痕中 fromVersion 必须是拒绝时真正生效的版本，调用方稍后重试即可。
         if (!switchLock.tryLock()) {
-            audit(action, ruleId, current.version(), version, reason, "REJECTED",
-                    "切换与实时判定/另一切换并发，明确拒绝，旧版本继续服务");
+            RuleDefinition busyCurrent = rules.get(ruleId);
+            audit(action, ruleId,
+                    busyCurrent == null ? null : busyCurrent.version(), version,
+                    reason, "REJECTED",
+                    REJECT_BUSY + "：切换与实时判定/另一切换并发，明确拒绝，"
+                            + "旧版本继续稳定服务，可稍后重试");
             throw new GatewayException(ErrorCode.RULE_SWITCH_CONFLICT,
                     "规则切换繁忙（与实时判定并发），已拒绝本次切换，"
-                            + "当前仍稳定生效 v" + current.version() + "，请稍后重试");
+                            + "当前仍稳定生效 v" + (busyCurrent == null ? "?"
+                                    : busyCurrent.version()) + "，请稍后重试");
         }
+        // 进入临界区后重新读取当前生效版本：所有版本判定（同版本拒绝/实际迁移版本）
+        // 都以锁内快照为准，消除锁外读旧值导致的留痕失真与重试时盲覆盖新引用。
+        RuleDefinition current;
         try {
+            current = rules.get(ruleId);
+            if (current == null) {
+                throw new GatewayException(ErrorCode.RULE_NOT_FOUND,
+                        "规则 " + ruleId + " 不存在，无法" + action);
+            }
+            if (current.version() == version) {
+                // 目标即当前版本（典型场景：并发的另一次切换已完成，本次请求/重试落到同版本）：
+                // 幂等拒绝，不产生重复 SUCCESS 留痕，也不移动任何引用。
+                audit(action, ruleId, current.version(), version, reason, "REJECTED",
+                        REJECT_SAME + "：目标版本即当前生效版本，切换被拒绝（无操作）");
+                throw new GatewayException(ErrorCode.RULE_SWITCH_CONFLICT,
+                        "规则 " + ruleId + " 当前已生效 v" + version + "，无需切换");
+            }
             Runnable switchHook = beforeSwitchHook;
             if (switchHook != null) {
                 switchHook.run();

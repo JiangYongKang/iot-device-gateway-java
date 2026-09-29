@@ -153,9 +153,23 @@ PENDING -> DOWNLOADING -> INSTALLING -> SUCCEEDED（此时才切换设备版本�
   与单条事件的“取版本快照 + 判定”在同一把**切换锁**上互斥：
   一条事件只可能整体按旧版本、或整体按新版本判定，**不会重复、漏掉或跨版本半截判定**；
 - 事件提交以 `eventId` 幂等去重，重复提交直接返回首次权威结论，不重复计数；
-- 明确拒绝、继续按旧版本稳定服务的情形（均不产生半生效状态）：
-  - 切换与实时判定/另一切换并发，`tryLock` 失败 → `RULE_SWITCH_CONFLICT`(409)，可稍后重试；
-  - 目标版本不存在 → `RULE_NOT_FOUND`(404)；目标即当前版本 → `RULE_SWITCH_CONFLICT`(409)；
+- **并发切换的三种结果，语义互斥、各自留痕，调用方按结果即可解释全过程**：
+  - **被拒绝（REJECTED，可重试，不等于整体失败）**：切换请求到达时切换锁正被一次实时
+    判定或另一次切换持有，`tryLock` 立即失败 → 返回 `RULE_SWITCH_CONFLICT`(409)。
+    拒绝路径**不触碰任何版本状态**：生效引用、已落地结论、处理计数全部不变，系统继续按
+    原版本稳定服务；允许调用方按约定退避重试。一次或多次合法拒绝**不计入任何失败指标**，
+    也不影响后续重试成功后的事件版本归属。
+  - **重试成功（SUCCESS）**：重试在锁空闲时进入临界区，锁内重新读取当前生效版本后整体替换
+    引用。成功只有一次，重试期间无论撞车多少次，成功切换的迁移路径固定为
+    “拒绝时真正生效的版本 → 目标版本”，不存在被拒后拿旧引用盲目覆盖新引用的半生效窗口。
+  - **目标即当前版本（REJECTED，无操作）**：典型场景是并发的另一次切换已经切到该版本，
+    本次请求或重试落到同版本——幂等拒绝，不移动引用、不追加成功记录。
+- 拒绝与成功的留痕分开可追溯（见 4.5），留痕的 `detail` 带稳定机读前缀，不随措辞/时序变化：
+  `REJECT_BUSY`（繁忙拒绝、可重试）、`REJECT_SAME`（目标即当前版本）、
+  `REJECT_MISSING`（目标版本不存在）；拒绝记录的 `fromVersion` 是**拒绝那一刻真正生效**
+  的版本（在拒绝现场重新读取，而非请求开始时的旧值）。
+- 其它明确拒绝、继续按旧版本稳定服务的情形（均不产生半生效状态）：
+  - 目标版本不存在 → `RULE_NOT_FOUND`(404)；
   - 容量上限打满（规则总数 / 单规则历史版本数）→ `QUOTA_EXCEEDED` / `CAPACITY_EXCEEDED`(429)，
     拒绝登记新版本并回滚内部版本号分配，不留半成品，已有规则照常服务；
   - 既有有界队列背压策略不变：队列满丢弃最旧并计数，与版本切换正交。
@@ -185,6 +199,12 @@ PENDING -> DOWNLOADING -> INSTALLING -> SUCCEEDED（此时才切换设备版本�
 `seq / action(TRIAL|ACTIVATE|ROLLBACK|REVIEW) / ruleId / fromVersion / toVersion /
 reason / outcome(SUCCESS|REJECTED) / detail / at`，经 `GET /api/rules/audit` 查询，
 被拒绝的操作同样留痕，可查清时间、原因、版本与结果。
+
+**成功记录与拒绝记录必须分开追溯**：按 `outcome` 过滤即可把“真正生效的一次切换”与
+“被拒/无操作的尝试”分开，对账时只以 SUCCESS 记录确认真实迁移路径，REJECTED 记录逐条
+解释并发时序；拒绝 `detail` 的稳定前缀 `REJECT_BUSY / REJECT_SAME / REJECT_MISSING`
+可直接用于机读分类与按拒绝原因分组统计，拒绝条数本身随并发时序变化属正常现象，
+不参与最终生效版本与事件归属的判定。
 
 ### 4.6 兼容范围
 
@@ -235,7 +255,7 @@ reason / outcome(SUCCESS|REJECTED) / detail / at`，经 `GET /api/rules/audit` �
 | FIRMWARE_INCOMPATIBLE | 422 | 型号/撤回/区间/同版本不兼容 |
 | FIRMWARE_ALREADY_IN_PROGRESS / FIRMWARE_DUPLICATE_REQUEST / FIRMWARE_NO_ACTIVE_UPGRADE | 409 | 单飞、幂等、状态不符 |
 | RULE_NOT_FOUND | 404 | 规则/历史版本/留存历史事件不存在 |
-| RULE_SWITCH_CONFLICT | 409 | 切换与实时判定并发被拒、目标即当前版本（旧版本继续稳定服务） |
+| RULE_SWITCH_CONFLICT | 409 | 切换繁忙被拒（REJECT_BUSY，旧版本继续服务、可重试）、目标即当前版本（REJECT_SAME，无操作） |
 | INVALID_REQUEST | 400 | 参数与请求体非法（含 JSON 解析错误归一化） |
 | INTERNAL_ERROR | 500 | 所有未预期底层异常的唯一对外出口 |
 
@@ -250,7 +270,23 @@ mvn spring-boot:run          # 启动（与原骨架一致）
 mvn -o test                  # 离线运行全部测试（不依赖外部服务）
 ```
 
-测试位于 `src/test/.../tests`，共 28 个用例，关键输入与判定依据均通过
+**并发切换反复验证（本地复现“偶发失败已消除”）**：
+
+```bash
+# 单轮：实时处理与两次切换并发 + 被拒后重试成功的确定性交织
+mvn -o test -Dtest='RuleGovernanceTest#concurrentSwitchAssignsEveryEventToExactlyOneVersionWithoutSplitOrLoss+rejectedSwitchKeepsOldVersionAndRetryAfterBusyPeriodSucceedsDeterministically'
+# 连跑 25 轮，全部必须稳定通过（拒绝条数随时序可变，但对账不变量逐轮成立）
+for i in $(seq 1 25); do
+  mvn -q -o test \
+    -Dtest='RuleGovernanceTest#concurrentSwitchAssignsEveryEventToExactlyOneVersionWithoutSplitOrLoss+rejectedSwitchKeepsOldVersionAndRetryAfterBusyPeriodSucceedsDeterministically'
+done
+```
+
+判读方式：运行期日志可见 `REJECT_BUSY` 的繁忙拒绝与重试，**拒绝出现与否、出现多少次都不影响
+最终结果**；每轮结束后的对账（事件唯一归属、最终生效 v3、SUCCESS 恰好两次且迁移路径
+1→2、2→3、统计差值 submitted=processed）必须逐轮一致。
+
+测试位于 `src/test/.../tests`，共 29 个用例，关键输入与判定依据均通过
 SLF4J 打印（日志前缀 `[关键输入]` / `[判定依据]` / `[版本选择]`）：
 
 - `SessionLifecycleTest`：未登记/未激活区分、幂等重入、接管失效、32 线程并发接入唯一会话；
@@ -259,13 +295,23 @@ SLF4J 打印（日志前缀 `[关键输入]` / `[判定依据]` / `[版本选择
 - `StateConvergenceTest`：整批拒绝无半更新、MATCHED/PENDING/REJECTED 收敛、并发 CAS；
 - `FirmwareUpgradeTest`：兼容区间拒绝、幂等/单飞、成功切版本、失败与失联回滚、分批隔离；
 - `RuleEngineTest`：规则版本绑定与更新后历史可区分、背压丢弃计数、毒消息隔离；
-- `RuleGovernanceTest`（本次新增，4 用例）：
+- `RuleGovernanceTest`（共 5 用例）：
   - 候选 vs 当前逐条试跑对比、同批同版本重复试跑结果一致、试跑零副作用（计数/生效版本不变）、
     内联样本与历史事件圈选等价；
   - 12 线程并发提交与两次版本切换并行，480 条事件逐条对账“恰好一次、归属版本与结论自洽、
-    不漏不串”；
+    不漏不串”；该用例以“阶段闸门 + 判定点计数”编排：先确认确有事件在对应版本的切换临界区
+    内开始判定再发起切换（真实制造切换撞车、可能被 BUSY 拒绝并重试），再在切换成功后开闸
+    放行下一阶段事件，最终对账只断言对**任意并发交织都成立**的不变量（逐条结论自洽、
+    成功切换恰好 1→2、2→3 两次、拒绝全部 REJECT_BUSY 且版本/时序可解释、统计 submitted=
+    processed=480 无丢弃无毒消息），不依赖“某线程恰好跑到某个序号”这类随负载漂移的偶然条件，
+    因此同一组用例连跑多轮结果稳定；
   - 判定占用切换锁时切换被明确拒绝（`RULE_SWITCH_CONFLICT`）、旧版本继续服务、
     不存在版本/重复切换拒绝、历史版本容量打满拒绝且无半成品、拒绝操作留痕；
+  - **确定性交织用例（本次新增）**：用屏障精确编排“实时判定占锁 → 两个切换尝试并发被拒
+    （REJECT_BUSY，且拒后生效版本仍是 v1）→ 判定结束 → 重试 v2 成功、事件归 v2 → 再切 v3
+    成功、事件归 v3 → 重复切换当前版本被 REJECT_SAME 拒绝”全过程，不依赖 tryLock 撞运气；
+    逐事件断言唯一归属与 fired 自洽、成功/繁忙拒绝/同版本拒绝三类留痕的条数版本对与先后顺序
+    全部确定、拒绝不污染统计（3 提交 3 处理）；
   - 回退到 v1 后新事件按 v1 判定，按 v1/v2 交叉复看旧事件，结论严格等于对应版本当时执行、
     落地结论不被篡改，回退/复看留痕可查；
 - `CapacityQuotaTest`：指令/遥测/设备数三类上限拒绝且无残留；
