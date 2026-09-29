@@ -11,6 +11,10 @@ public class GatewayProperties {
     private int maxEventsPerDevice = 500;
     private long commandTtlSeconds = 300;
     private int maxDevices = 1000;
+    private int maxRuleVersionsPerRule = 50;
+    private int maxRules = 200;
+    private int maxAuditEntries = 2000;
+    private int maxStoredEvents = 5000;
 
     public int getMaxCommandsPerDevice() { return maxCommandsPerDevice; }
     public void setMaxCommandsPerDevice(int v) { this.maxCommandsPerDevice = v; }
@@ -24,4 +28,12 @@ public class GatewayProperties {
     public void setCommandTtlSeconds(long v) { this.commandTtlSeconds = v; }
     public int getMaxDevices() { return maxDevices; }
     public void setMaxDevices(int v) { this.maxDevices = v; }
+    public int getMaxRuleVersionsPerRule() { return maxRuleVersionsPerRule; }
+    public void setMaxRuleVersionsPerRule(int v) { this.maxRuleVersionsPerRule = v; }
+    public int getMaxRules() { return maxRules; }
+    public void setMaxRules(int v) { this.maxRules = v; }
+    public int getMaxAuditEntries() { return maxAuditEntries; }
+    public void setMaxAuditEntries(int v) { this.maxAuditEntries = v; }
+    public int getMaxStoredEvents() { return maxStoredEvents; }
+    public void setMaxStoredEvents(int v) { this.maxStoredEvents = v; }
 }

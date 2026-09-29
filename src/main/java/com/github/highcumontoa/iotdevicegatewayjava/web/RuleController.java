@@ -6,7 +6,10 @@ import com.github.highcumontoa.iotdevicegatewayjava.model.RuleVerdict;
 import com.github.highcumontoa.iotdevicegatewayjava.rule.RuleBackpressureStats;
 import com.github.highcumontoa.iotdevicegatewayjava.rule.RuleEngineService;
 import com.github.highcumontoa.iotdevicegatewayjava.web.dto.EventRequest;
+import com.github.highcumontoa.iotdevicegatewayjava.web.dto.RuleCandidateRequest;
 import com.github.highcumontoa.iotdevicegatewayjava.web.dto.RuleRequest;
+import com.github.highcumontoa.iotdevicegatewayjava.web.dto.RuleSwitchRequest;
+import com.github.highcumontoa.iotdevicegatewayjava.web.dto.RuleTrialRequest;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -59,5 +62,51 @@ public class RuleController {
     @GetMapping("/stats")
     public RuleBackpressureStats stats() {
         return rules.stats();
+    }
+
+    // ===== 规则治理：候选试跑 / 切换 / 回退 / 历史复看 =====
+
+    @PostMapping("/candidates")
+    public RuleDefinition prepareCandidate(@RequestBody RuleCandidateRequest req) {
+        return rules.prepareCandidate(new RuleDefinition(req.ruleId(), 0, req.metricField(),
+                req.threshold(), req.action(), !Boolean.FALSE.equals(req.enabled()),
+                Instant.now()), req.reason());
+    }
+
+    @PostMapping("/trials")
+    public com.github.highcumontoa.iotdevicegatewayjava.model.rulegov.TrialReport runTrial(
+            @RequestBody RuleTrialRequest req) {
+        return rules.runTrial(req.ruleId(), req.candidateVersion(),
+                req.eventIds(), req.samples(), req.reason());
+    }
+
+    @PostMapping("/activate")
+    public RuleDefinition activate(@RequestBody RuleSwitchRequest req) {
+        return rules.activate(req.ruleId(), req.version(), req.reason());
+    }
+
+    @PostMapping("/rollback")
+    public RuleDefinition rollback(@RequestBody RuleSwitchRequest req) {
+        return rules.rollback(req.ruleId(), req.version(), req.reason());
+    }
+
+    @PostMapping("/events/review")
+    public com.github.highcumontoa.iotdevicegatewayjava.model.rulegov.RuleReviewResult review(
+            @RequestBody EventRequest req, @RequestParam String ruleId,
+            @RequestParam int ruleVersion) {
+        Instant ts = req.occurredAt() == null ? Instant.now() : req.occurredAt();
+        return rules.review(ruleId, ruleVersion, new EventRecord(req.eventId(), req.deviceId(),
+                req.telemetrySeq(), req.metricField(), req.value(), ts));
+    }
+
+    @GetMapping("/{ruleId}/versions")
+    public List<RuleDefinition> versions(@PathVariable String ruleId) {
+        return rules.ruleHistory(ruleId);
+    }
+
+    @GetMapping("/audit")
+    public List<com.github.highcumontoa.iotdevicegatewayjava.model.rulegov.RuleAuditEntry> audit(
+            @RequestParam(required = false) String ruleId) {
+        return rules.auditTrail(ruleId);
     }
 }
